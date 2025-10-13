@@ -15,12 +15,17 @@ DB_NUMBER = 1
 BYTE_INDEX = 0
 BIT_INDEX = 1
 
-def monitor_plc(client, last_state=None, parada_atual=None):
+def monitor_plc(client, last_state, parada_atual=None):
+    """
+    Função recursiva para monitorar a linha do PLC.
+    Cria parada quando a linha para e finaliza quando ela volta a rodar.
+    """
     try:
+        # Lê estado atual do PLC
         data = client.db_read(DB_NUMBER, BYTE_INDEX, 1)
         current_state = get_bool(data, 0, BIT_INDEX)
 
-        # Detecta início da parada
+        # Detecta início da parada (linha rodava e parou)
         if last_state is True and current_state is False and parada_atual is None:
             try:
                 parada_atual = ParadasLinha.objects.create(
@@ -31,7 +36,7 @@ def monitor_plc(client, last_state=None, parada_atual=None):
             except Exception as e:
                 print(f"❌ Erro ao criar parada: {e}")
 
-        # Detecta fim da parada
+        # Detecta fim da parada (linha estava parada e voltou a rodar)
         if last_state is False and current_state is True and parada_atual:
             try:
                 parada_atual.fim_parada = datetime.now()
@@ -39,7 +44,7 @@ def monitor_plc(client, last_state=None, parada_atual=None):
                 print(f"🟢 Linha VOLTOU às {parada_atual.fim_parada}")
             except Exception as e:
                 print(f"❌ Erro ao salvar parada: {e}")
-            # Aqui substituímos o 'break' por 'return' para encerrar a recursão
+            # Interrompe a recursão ao finalizar a parada
             return
 
         # Atualiza o estado e chama recursivamente
@@ -58,11 +63,19 @@ def main():
         client.connect(PLC_IP, RACK, SLOT)
         if client.get_connected():
             print(f"✅ Conectado ao PLC em {PLC_IP}")
-            monitor_plc(client)  # inicia a recursão
+
+            # Lê o estado inicial do PLC antes de iniciar a recursão
+            initial_data = client.db_read(DB_NUMBER, BYTE_INDEX, 1)
+            initial_state = get_bool(initial_data, 0, BIT_INDEX)
+
+            monitor_plc(client, last_state=initial_state, parada_atual=None)
+
         else:
             print("❌ Falha na conexão com o PLC.")
+
     except Exception as e:
         print(f"❌ Ocorreu um erro ao conectar: {e}")
+
     finally:
         client.disconnect()
         print("🔌 Desconectado do PLC.")
