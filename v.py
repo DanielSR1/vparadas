@@ -1,85 +1,60 @@
-# producao/plc_monitor.py
 import os
-import time
-import django
-import snap7
-from snap7.util import get_bool
-from datetime import datetime
-from producao.models import ParadasLinha
+import sqlite3
+import threading
+from django.apps import AppConfig
 
-# --- Configuração do PLC ---
-PLC_IP = "192.168.0.1"
-RACK = 0
-SLOT = 3
-DB_NUMBER = 1
-BYTE_INDEX = 0
-BIT_INDEX = 1
-SLEEP_TIME = 0.5   # tempo entre leituras (segundos)
-CONFIRM_READS = 2  # número de leituras consecutivas para confirmar mudança
+class ProducaoConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'producao'
 
-def main():
-    client = snap7.client.Client()
-    try:
-        client.connect(PLC_IP, RACK, SLOT)
-        if not client.get_connected():
-            print("❌ Falha na conexão com o PLC.")
+    def ready(self):
+        # 🔒 Evita que o código abaixo rode duas vezes com o runserver
+        if os.environ.get('RUN_MAIN') != 'true':
+            print("⏭️ Ignorando execução duplicada (processo do reloader).")
             return
 
-        print(f"✅ Conectado ao PLC em {PLC_IP}")
+        # --- Criação das tabelas (opcional, se não usar migrations) ---
+        from django.conf import settings
+        db_path = settings.DATABASES['default']['NAME']
 
-        # Leitura inicial
-        data = client.db_read(DB_NUMBER, BYTE_INDEX, 1)
-        last_state = get_bool(data, 0, BIT_INDEX)
-        parada_atual = None
-        print(f"🔍 Estado inicial: {'RODANDO' if last_state else 'PARADO'}")
-
-        stable_state = last_state
-        confirm_count = 0  # contador de leituras consecutivas iguais
-
-        while True:
+        if os.path.exists(db_path):
             try:
-                data = client.db_read(DB_NUMBER, BYTE_INDEX, 1)
-                current_state = get_bool(data, 0, BIT_INDEX)
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
 
-                # Verifica se o estado permaneceu igual ao anterior
-                if current_state == stable_state:
-                    confirm_count = 0  # nada mudou
-                else:
-                    # Estado diferente → incrementa contador de confirmação
-                    confirm_count += 1
+                # Tabela paradas_linha
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS paradas_linha (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        nome_linha TEXT NOT NULL,
+                        inicio_parada TEXT NOT NULL,
+                        fim_parada TEXT
+                    );
+                """)
 
-                    # Se confirmou a mudança (2 leituras seguidas com mesmo valor)
-                    if confirm_count >= CONFIRM_READS:
-                        confirm_count = 0
-                        last_state, stable_state = stable_state, current_state
+                # Tabela motivos_paradas
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS motivos_paradas (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        nome_linha TEXT NOT NULL,
+                        inicio_parada TEXT NOT NULL,
+                        fim_parada TEXT,
+                        motivo TEXT NOT NULL
+                    );
+                """)
 
-                        # --- Início de parada (linha rodava e parou) ---
-                        if last_state is True and current_state is False:
-                            parada_atual = ParadasLinha.objects.create(
-                                nome_linha="slitter",
-                                inicio_parada=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            )
-                            print(f"🔴 Linha PAROU às {parada_atual.inicio_parada}")
+                conn.commit()
+                print("✅ Tabelas 'paradas_linha' e 'motivos_paradas' verificadas/criadas com sucesso.")
+            except sqlite3.Error as e:
+                print(f"❌ Erro ao acessar o banco de dados: {e}")
+            finally:
+                conn.close()
 
-                        # --- Fim da parada (linha estava parada e voltou a rodar) ---
-                        elif last_state is False and current_state is True and parada_atual:
-                            parada_atual.fim_parada = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            parada_atual.save()
-                            print(f"🟢 Linha VOLTOU às {parada_atual.fim_parada}")
-                            parada_atual = None
-
-                        # Atualiza o estado estável
-                        stable_state = current_state
-
-                time.sleep(SLEEP_TIME)
-
-            except Exception as e:
-                print(f"⚠️ Erro na leitura: {e}")
-                time.sleep(1)
-
-    except Exception as e:
-        print(f"❌ Ocorreu um erro ao conectar: {e}")
-
-    finally:
-        client.disconnect()
-        print("🔌 Desconectado do PLC.")
+        # --- Inicializa o monitor do PLC em thread ---
+        try:
+            from .plc_monitor import main  # precisa ter def main() no plc_monitor.py
+            t = threading.Thread(target=main, daemon=True)
+            t.start()
+            print("✅ Thread do PLC Monitor iniciada (executada apenas 1x).")
+        except ImportError as e:
+            print(f"❌ Não foi possível importar plc_monitor.py: {e}")
